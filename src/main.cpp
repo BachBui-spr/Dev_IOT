@@ -1,232 +1,251 @@
-#define LED_PIN 48
-#define SDA_PIN GPIO_NUM_11
-#define SCL_PIN GPIO_NUM_12
-
-#define MQ2_PIN 34
-
-#define DHT_PIN  GPIO_NUM_6  
-#define DHT_TYPE DHT11 
 
 
-#include <WiFi.h>
+// Import required libraries
+#include "WiFi.h"
+#include "ThingsBoard.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// Import supported libraries
 #include <Arduino_MQTT_Client.h>
-#include <ThingsBoard.h>
-#include "DHT20.h"
-#include "Wire.h"
-#include <ArduinoOTA.h>
+#include <Adafruit_Sensor.h>
 #include <DHT.h>
+#include <DHT_U.h>
 
-DHT dht(DHT_PIN, DHT_TYPE); 
-constexpr char WIFI_SSID[] = "BBSpr";
-constexpr char WIFI_PASSWORD[] = "12042004";
+// Import supported OTA
+#include <OTA_Firmware_Update.h>
+#include <Espressif_Updater.h>
 
-constexpr char TOKEN[] = "sQpFV6Cro2XvIGQSJCEs";
+#define DEBUG 1
 
+// Replace with your network credentials
+const char *ssid = "271104E";
+const char *password = "1234567890";
+
+/* OTA Firmware object ---------------------------------------------*/
+// Firmware title and version used to compare with remote version, to check if an update is needed.
+// Title needs to be the same and version needs to be different --> downgrading is possible
+constexpr char CURRENT_FIRMWARE_TITLE[] = "Lab1_IOT";
+constexpr char CURRENT_FIRMWARE_VERSION[] = "1.0.0";
+
+// Maximum amount of retries we attempt to download each firmware chunck over MQTT
+constexpr uint8_t FIRMWARE_FAILURE_RETRIES = 12U;
+// Size of each firmware chunck downloaded over MQTT,
+// increased packet size, might increase download speed
+constexpr uint16_t FIRMWARE_PACKET_SIZE = 4096U;
+
+// Statuses for updating
+bool currentFWSent = false;
+bool updateRequestSent = false;
+
+/* Server object ---------------------------------------------*/
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
-constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
-constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
+constexpr uint16_t MAX_MESSAGE_SEND_SIZE = 512U;
+constexpr uint16_t MAX_MESSAGE_RECEIVE_SIZE = 256U;
 
-constexpr char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
-constexpr char LED_MODE_ATTR[] = "ledMode";
-constexpr char LED_STATE_ATTR[] = "ledState";
+// Initialize used apis
+OTA_Firmware_Update<> ota;
+const std::array<IAPI_Implementation *, 1U> apis = {
+    &ota};
 
-volatile bool attributesChanged = false;
-volatile int ledMode = 0;
-volatile bool ledState = false;
+WiFiClient espClient;
+Arduino_MQTT_Client mqttClient(espClient);
+ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, Default_Max_Stack_Size, apis);
 
-constexpr uint16_t BLINKING_INTERVAL_MS_MIN = 10U;
-constexpr uint16_t BLINKING_INTERVAL_MS_MAX = 60000U;
-volatile uint16_t blinkingInterval = 1000U;
+Espressif_Updater<> updater;
 
-uint32_t previousStateChange;
+// Set up the device properties on server
+constexpr char DEVICE_TOKEN[] = "Lab1_IOT";
+constexpr char TEMPERATURE_KEY[] = "temperature";
+constexpr char HUMIDITY_KEY[] = "humidity";
 
-constexpr int16_t telemetrySendInterval = 10000U;
-uint32_t previousDataSend;
+/* Sensor object ---------------------------------------------*/
+#define DHTPIN 6
+#define DHTTYPE DHT11
+DHT_Unified dht(DHTPIN, DHTTYPE);
+typedef struct
+{
+  float Temperature = 0.0;
+  float Humidity = 0.0;
+} DHT20_Data_t;
 
-constexpr std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
-  LED_STATE_ATTR,
-  BLINKING_INTERVAL_ATTR
-};
+DHT20_Data_t DHT20_Data;
 
-WiFiClient wifiClient;
-Arduino_MQTT_Client mqttClient(wifiClient);
-ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
+// Task object
+TaskHandle_t WifiTask_handle;
+TaskHandle_t SensorTask_handle;
+TaskHandle_t PublishData_handle;
+TaskHandle_t ServerTask_handle;
 
-DHT20 dht20;
+/* OTA Callback ----------------------------------------------*/
 
-RPC_Response setLedSwitchState(const RPC_Data &data) {
-    Serial.println("Received Switch state");
-    bool newState = data;
-    Serial.print("Switch state change: ");
-    Serial.println(newState);
-    digitalWrite(LED_PIN, newState);
-    attributesChanged = true;
-    return RPC_Response("setLedSwitchValue", newState);
+/// @brief Update starting callback method that will be called as soon as the shared attribute firmware keys have been received and processed
+/// and the moment before we subscribe the necessary topics for the OTA firmware update.
+/// Is meant to give a moment were any additional processes or communication with the cloud can be stopped to ensure the update process runs as smooth as possible.
+/// To ensure that calling the ThingsBoardSized::Cleanup_Subscriptions() method can be used which stops any receiving of data over MQTT besides the one for the OTA firmware update,
+/// if this method is used ensure to call all subscribe methods again so they can be resubscribed, in the method passed to the finished_callback if the update failed and we do not restart the device
+void update_starting_callback()
+{
+  // Nothing to do
+  Serial.println("Suspend All Task");
+  vTaskSuspend(SensorTask_handle);
+  vTaskSuspend(PublishData_handle);
 }
 
-const std::array<RPC_Callback, 1U> callbacks = {
-  RPC_Callback{ "setLedSwitchValue", setLedSwitchState }
-};
+/// @brief End callback method that will be called as soon as the OTA firmware update, either finished successfully or failed.
+/// Is meant to allow to either restart the device if the udpate was successfull or to restart any stopped services before the update started in the subscribed update_starting_callback
+/// @param success Either true (update successful) or false (update failed)
+void finished_callback(const bool &success)
+{
+  if (success)
+  {
+    Serial.println("Done, Reboot now");
 
-void processSharedAttributes(const Shared_Attribute_Data &data) {
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    if (strcmp(it->key().c_str(), BLINKING_INTERVAL_ATTR) == 0) {
-      const uint16_t new_interval = it->value().as<uint16_t>();
-      if (new_interval >= BLINKING_INTERVAL_MS_MIN && new_interval <= BLINKING_INTERVAL_MS_MAX) {
-        blinkingInterval = new_interval;
-        Serial.print("Blinking interval is set to: ");
-        Serial.println(new_interval);
-      }
-    } else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
-      ledState = it->value().as<bool>();
-      digitalWrite(LED_PIN, ledState);
-      Serial.print("LED state is set to: ");
-      Serial.println(ledState);
-    }
+    esp_restart();
+    return;
   }
-  attributesChanged = true;
+  Serial.println("Downloading firmware failed");
 }
 
-const Shared_Attribute_Callback attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-const Attribute_Request_Callback attribute_shared_request_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-
-void InitWiFi() {
-  Serial.println("Connecting to AP ...");
-  // Attempting to establish a connection to the given WiFi network
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    // Delay 500ms until a connection has been successfully established
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("Connected to AP");
+/// @brief Progress callback method that will be called every time our current progress of downloading the complete firmware data changed,
+/// meaning it will be called if the amount of already downloaded chunks increased.
+/// Is meant to allow to display a progress bar or print the current progress of the update into the console with the currently already downloaded amount of chunks and the total amount of chunks
+/// @param current Already received and processs amount of chunks
+/// @param total Total amount of chunks we need to receive and process until the update has completed
+void progress_callback(const size_t &current, const size_t &total)
+{
+  Serial.printf("Progress %.2f%%\n", static_cast<float>(current * 100U) / total);
 }
 
-const bool reconnect() {
-  // Check to ensure we aren't connected yet
-  const wl_status_t status = WiFi.status();
-  if (status == WL_CONNECTED) {
-    return true;
-  }
-  // If we aren't establish a new connection to the given WiFi network
-  InitWiFi();
-  return true;
-}
-
-void SensorTask(void *pvParameters) {
-  dht.begin(); 
-  while(1) {
-      float temperature = dht.readTemperature(); 
-      float humidity = dht.readHumidity();         
-
-      if (isnan(temperature) || isnan(humidity)) {
-          Serial.println("Failed to read from DHT sensor!");
-      } else {
-          Serial.print("Temp: ");
-          Serial.print(temperature);
-          Serial.print(" *C ");
-          Serial.print("Humidity: ");
-          Serial.print(humidity);
-          Serial.println(" %");
-      }
-      vTaskDelay(5000 / portTICK_PERIOD_MS);
-  }
-}
-
-void LEDTask(void *pvParameters) {
-  pinMode(LED_PIN, OUTPUT);
-  while (true) {
-      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-      vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
-
-//uint32_t previousDataSend = 0;
-
-void WiFiTask(void *pvParameters) {
-    while (true) {
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Connecting to WiFi...");
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-            int retry = 0;
-            while (WiFi.status() != WL_CONNECTED && retry < 20) {
-                delay(500);
-                retry++;
-            }
-            if (WiFi.status() == WL_CONNECTED) {
-                Serial.println("WiFi Connected!");
-            } else {
-                Serial.println("WiFi Connection Failed!");
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(30000)); // Kiểm tra lại mỗi 30 giây
-    }
-}
-
-void MQTTTask(void *pvParameters) {
-  while (true) {
-      if (!tb.connected()) {
-          Serial.println("Connecting to ThingsBoard...");
-          if (tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-              Serial.println("Connected to ThingsBoard!");
-              tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
-
-              // Đăng ký RPC và nhận thuộc tính chia sẻ
-              if (!tb.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-                  Serial.println("Failed to subscribe for RPC");
-              }
-              if (!tb.Shared_Attributes_Subscribe(attributes_callback)) {
-                  Serial.println("Failed to subscribe for shared attribute updates");
-              }
-          } else {
-              Serial.println("Failed to connect to ThingsBoard. Retrying...");
-              vTaskDelay(pdMS_TO_TICKS(5000));
-              continue;
-          }
-      }
-
-      // Đọc dữ liệu từ cảm biến
-      float temperature = dht.readTemperature();
-      float humidity = dht.readHumidity();
-
-      if (!isnan(temperature) && !isnan(humidity)) {
-          Serial.print("Sending Temperature: ");
-          Serial.print(temperature);
-          Serial.print(" °C, Humidity: ");
-          Serial.print(humidity);
-          Serial.println(" %");
-
-          tb.sendTelemetryData("temperature", temperature);
-          tb.sendTelemetryData("humidity", humidity);
-      } else {
-          Serial.println("Failed to read from DHT sensor!");
-      }
-
-      // Gửi dữ liệu WiFi
-      tb.sendAttributeData("rssi", WiFi.RSSI());
-      tb.sendAttributeData("channel", WiFi.channel());
-      tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-      tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-      tb.sendAttributeData("ssid", WiFi.SSID().c_str());
-
-      tb.loop();
-      vTaskDelay(pdMS_TO_TICKS(10000));  // Gửi dữ liệu mỗi 10 giây
-  }
-}
-
-
-
-void setup() {
+// Task to handle Wi-Fi connection
+void wifiTask(void *pvParameters)
+{
   Serial.begin(115200);
-  xTaskCreate(WiFiTask, "WiFiTask", 4096, NULL, 1, NULL);
-  xTaskCreate(MQTTTask, "MQTTTask", 4096, NULL, 1, NULL);
-  xTaskCreate(SensorTask, "SensorTask", 4096, NULL, 1, NULL);
-  xTaskCreate(LEDTask, "LEDTask", 2048, NULL, 1, NULL);
-  //xTaskCreate(MQ2Task, "MQ2Task", 2048, NULL, 1, NULL);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+#ifdef DEBUG
+    Serial.println("Connecting to WiFi..");
+#endif
+  }
+
+  // Print ESP32 Local IP Address
+  Serial.println(WiFi.localIP());
+  vTaskResume(ServerTask_handle);  
+  vTaskSuspend(NULL); // Delete the task when done
 }
 
-void loop() {
+// Task to read value from DHT20
+void sensorTask(void *pvParameters)
+{
+  dht.begin(); // Start sensor
+  sensors_event_t event;
 
+  while (1)
+  {
+    dht.temperature().getEvent(&event);
+    // get temperature value
+    DHT20_Data.Temperature = event.temperature;
+    vTaskDelay(5);
+    dht.humidity().getEvent(&event);
+    // get humidity value
+    DHT20_Data.Humidity = event.relative_humidity;
+#ifdef DEBUG
+    Serial.printf("Firmware version: %s | temperature: %.3f | Humidity: %.3f \n", CURRENT_FIRMWARE_VERSION, DHT20_Data.Temperature, DHT20_Data.Humidity);
+#endif
+
+    // get sensor data periodly
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// Task to publish data to coreiot server
+void publishdataTask(void *pvParameters)
+{
+
+  while (1)
+  {
+    tb.sendTelemetryData(TEMPERATURE_KEY, DHT20_Data.Temperature);
+    tb.sendTelemetryData(HUMIDITY_KEY, DHT20_Data.Humidity);
+    // publish data periodly
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+  }
+}
+
+void ServerTask(void *pvParameters)
+{
+  uint8_t first = 1;
+  while (1)
+  {
+    if (!tb.connected())
+    {
+#ifdef DEBUG
+      Serial.printf("Connecting to: (%s) with token (%s)\n", THINGSBOARD_SERVER, DEVICE_TOKEN);
+#endif
+      if (!tb.connect(THINGSBOARD_SERVER, DEVICE_TOKEN, THINGSBOARD_PORT))
+      {
+#ifdef DEBUG
+        Serial.println("Failed to connect");
+#endif
+        if(!first){
+          vTaskSuspend(PublishData_handle);
+        }
+      }
+      else
+      {                
+        first = 0;
+        vTaskResume(PublishData_handle);
+#ifdef DEBUG
+        Serial.println("Connected");
+#endif
+      }
+    }
+
+    if (!currentFWSent)
+    {
+      currentFWSent = ota.Firmware_Send_Info(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION);
+    }
+
+    if (!updateRequestSent)
+    {
+      Serial.println("Firwmare Update Subscription...");
+      const OTA_Update_Callback callback(CURRENT_FIRMWARE_TITLE, CURRENT_FIRMWARE_VERSION, &updater, &finished_callback, &progress_callback, &update_starting_callback, FIRMWARE_FAILURE_RETRIES, FIRMWARE_PACKET_SIZE);
+      // See https://thingsboard.io/docs/user-guide/ota-updates/
+      // to understand how to create a new OTA pacakge and assign it to a device so it can download it.
+      // Sending the request again after a successfull update will automatically send the UPDATED firmware state,
+      // because the assigned firmware title and version on the cloud and the firmware version and title we booted into are the same.
+      updateRequestSent = ota.Subscribe_Firmware_Update(callback);
+      if (!updateRequestSent)
+      {
+        Serial.println("Firwmare Update Subscription Success");
+      }
+      else
+      {
+        Serial.println("Firwmare Update Subscription Fail");
+      }
+    }
+
+    tb.loop();
+  }
+}
+
+void setup()
+{
+
+  // Create tasks for Wi-Fi and server
+  xTaskCreate(sensorTask, "SensorTask", 1024 * 4, NULL, 3, &SensorTask_handle);  
+  xTaskCreate(publishdataTask, "PublishDataTask", 1024 * 4, NULL, 2, &PublishData_handle);
+  vTaskSuspend(PublishData_handle);
+  xTaskCreate(ServerTask, "ServerTask", 1024 * 4, NULL, 1, &ServerTask_handle);
+  xTaskCreate(wifiTask, "WiFiTask", 1024 * 4, NULL, 1, &WifiTask_handle);
+}
+
+void loop()
+{
+  // Nothing to do here, FreeRTOS tasks handle the work
+  // Push the main loop to the idle task to save the energy
+  vTaskDelay(portMAX_DELAY);
 }
