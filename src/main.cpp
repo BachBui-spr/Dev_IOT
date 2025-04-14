@@ -18,8 +18,8 @@
 #define DEBUG 1
 
 // Replace with your network credentials
-const char* ssid = "271104E";
-const char* password = "1234567890";
+const char* ssid = "BBSpr";
+const char* password = "12042004";
 
 
 /* Server object ---------------------------------------------*/
@@ -42,7 +42,7 @@ const std::array<IAPI_Implementation*, 1U> apis = {
 ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, Default_Max_Stack_Size, apis);
 
 // Set up the device properties on server
-constexpr char DEVICE_TOKEN[] = "Lab1_IOT";
+constexpr char DEVICE_TOKEN[] = "8ozyb1mwmix1x9e53skf";
 constexpr char TEMPERATURE_KEY[] = "temperature";
 constexpr char HUMIDITY_KEY[] = "humidity";
 constexpr char SHARED_ATTRIBUTE_KEY[] = "measurement_status";
@@ -52,7 +52,7 @@ bool subscribed = false;
 
 /* Sensor object ---------------------------------------------*/
 #define DHTPIN 6
-#define DHTTYPE    DHT11 
+#define DHTTYPE    DHT22 
 DHT_Unified dht(DHTPIN, DHTTYPE);
 typedef struct {
   float Temperature = 0.0;
