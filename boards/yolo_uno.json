@@ -34,7 +34,7 @@
     "arduino",
     "espidf"
   ],
-  "name": "Yolo_Uno_S3",
+  "name": "Yolo Uno S3",
   "upload": {
     "flash_size": "8MB",
     "maximum_ram_size": 327680,

@@ -19,8 +19,8 @@
 #define DEBUG 1
 
 // Replace with your network credentials
-const char *ssid = "271104E";
-const char *password = "1234567890";
+const char *ssid = "BBSpr";
+const char *password = "12042004";
 
 /* OTA Firmware object ---------------------------------------------*/
 // Firmware title and version used to compare with remote version, to check if an update is needed.
@@ -57,7 +57,7 @@ ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, Defa
 Espressif_Updater<> updater;
 
 // Set up the device properties on server
-constexpr char DEVICE_TOKEN[] = "Lab1_IOT";
+constexpr char DEVICE_TOKEN[] = "8ozyb1mwmix1x9e53skf";
 constexpr char TEMPERATURE_KEY[] = "temperature";
 constexpr char HUMIDITY_KEY[] = "humidity";
 

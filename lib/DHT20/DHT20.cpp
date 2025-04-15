@@ -1,7 +1,7 @@
 //
 //    FILE: DHT20.cpp
 //  AUTHOR: Rob Tillaart
-// VERSION: 0.2.2
+// VERSION: 0.3.1
 // PURPOSE: Arduino library for DHT20 I2C temperature and humidity sensor.
 
 
@@ -31,25 +31,9 @@ DHT20::DHT20(TwoWire *wire)
 
 bool DHT20::begin()
 {
-  _wire->begin();
   //  _wire->setWireTimeout(DHT20_WIRE_TIME_OUT, true);
   return isConnected();
 }
-
-
-#if defined(ESP8266) || defined(ESP32)
-bool DHT20::begin(const uint8_t dataPin, const uint8_t clockPin)
-{
-  if ((dataPin < 255) && (clockPin < 255))
-  {
-    _wire->begin(dataPin, clockPin);
-  } else {
-    _wire->begin();
-  }
-  //  _wire->setWireTimeout(DHT20_WIRE_TIME_OUT, true);
-  return isConnected();
-}
-#endif
 
 
 bool DHT20::isConnected()
@@ -98,8 +82,13 @@ int DHT20::read()
   int status = requestData();
   if (status < 0) return status;
   //  wait for measurement ready
+  uint32_t start = millis();
   while (isMeasuring())
   {
+    if (millis() - start >= 1000)
+    {
+      return DHT20_ERROR_READ_TIMEOUT;
+    }
     yield();
   }
   //  read the measurement
