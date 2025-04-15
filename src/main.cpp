@@ -63,7 +63,7 @@ constexpr char HUMIDITY_KEY[] = "humidity";
 
 /* Sensor object ---------------------------------------------*/
 #define DHTPIN 6
-#define DHTTYPE DHT11
+#define DHTTYPE DHT22
 DHT_Unified dht(DHTPIN, DHTTYPE);
 typedef struct
 {
